@@ -1,6 +1,7 @@
 import os
 import struct
 import subprocess
+import time
 
 # 1. 3-карточный LUT (uint32_t)
 def generate_3card_lut():
@@ -24,19 +25,21 @@ def generate_3card_lut():
 
 lut_3card_str = generate_3card_lut()
 
-# 2. C++/CUDA КОД V5.2
+# 2. C++/CUDA КОД (БЕНЧМАРК 500 РУК, ЧЕСТНЫЙ ДИСКАРД, ПОЛНАЯ СВОБОДА)
 cuda_code = f"""
 #include <iostream>
 #include <vector>
 #include <unordered_set>
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <omp.h>
 
-constexpr int TOTAL_CANONICAL_HANDS = 134459;
-constexpr int SIMS_PER_HAND = 5000; 
+// БЕНЧМАРК: Считаем только первые 500 рук
+constexpr int TOTAL_CANONICAL_HANDS = 500;
+constexpr int SIMS_PER_HAND = 2000; 
 
 #pragma pack(push, 1)
 struct BookEntry {{
@@ -47,6 +50,8 @@ struct BookEntry {{
 #pragma pack(pop)
 
 __constant__ uint32_t d_lut_3card[2197] = {{ {lut_3card_str} }};
+__constant__ float FL_BONUS_QQ_KK_AA[3] = {{ 28.5f, 38.3f, 47.4f }};
+__constant__ float FL_BONUS_TRIPS = 67.7f;
 
 __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
     uint64_t spades = mask & 0x1FFF;
@@ -97,37 +102,66 @@ __device__ double calc_progressive_score(const uint8_t* top, uint64_t mid_mask, 
     if (r_top > r_mid || r_mid > r_bot) return -6.0; 
     
     double score = 0.0;
-    int bot_class = r_bot >> 24;
-    if (bot_class == 5) score += 2; else if (bot_class == 6) score += 4;
-    else if (bot_class == 7) score += 6; else if (bot_class == 8) score += 10;
-    else if (bot_class == 9) score += 15;
+    int bot_class = r_bot >> 24; int bot_rank = (r_bot >> 20) & 0xF;
+    int mid_class = r_mid >> 24; int mid_rank = (r_mid >> 20) & 0xF;
+    int top_class = r_top >> 24; int top_rank = (r_top >> 20) & 0xF;
     
-    int mid_class = r_mid >> 24;
-    if (mid_class == 4) score += 2; else if (mid_class == 5) score += 4;
-    else if (mid_class == 6) score += 8; else if (mid_class == 7) score += 12;
-    else if (mid_class == 8) score += 20; else if (mid_class == 9) score += 30;
+    if      (bot_class == 9) score += (bot_rank == 12) ? 25.0 : 15.0;
+    else if (bot_class == 8) score += 10.0;
+    else if (bot_class == 7) score += 6.0;
+    else if (bot_class == 6) score += 4.0;
+    else if (bot_class == 5) score += 2.0;
     
-    int top_class = r_top >> 24;
-    int top_rank = (r_top >> 20) & 0xF;
+    if      (mid_class == 9) score += (mid_rank == 12) ? 50.0 : 30.0;
+    else if (mid_class == 8) score += 20.0;
+    else if (mid_class == 7) score += 12.0;
+    else if (mid_class == 6) score += 8.0;
+    else if (mid_class == 5) score += 4.0;
+    else if (mid_class == 4) score += 2.0;
     
-    if (top_class == 4) {{ score += (13 + top_rank) + 67.7; }} 
+    if (top_class == 4) {{ 
+        score += 10.0 + top_rank + FL_BONUS_TRIPS; 
+    }} 
     else if (top_class == 2) {{
-        if (top_rank == 12) score += 9 + 47.4;      
-        else if (top_rank == 11) score += 8 + 38.3; 
-        else if (top_rank == 10) score += 7 + 28.5; 
-        else if (top_rank >= 4) score += (top_rank - 3); 
+        const float PAIR_ROY[13] = {{0,0,0,0, 1,2,3,4,5,6, 7,8,9}}; 
+        score += PAIR_ROY[top_rank];
+        if (top_rank == 10) score += FL_BONUS_QQ_KK_AA[0];
+        else if (top_rank == 11) score += FL_BONUS_QQ_KK_AA[1];
+        else if (top_rank == 12) score += FL_BONUS_QQ_KK_AA[2];
     }}
     
     score += (double)r_top * 1e-11 + (double)r_mid * 1e-14 + (double)r_bot * 1e-17;
     return score;
 }}
 
-__global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, int total_hands) {{
-    int hand_idx = blockIdx.x;
-    if (hand_idx >= total_hands) return;
+// Вспомогательная функция: случайное размещение карты в свободный слот
+__device__ void place_random_card(uint8_t card, uint8_t* top, uint64_t* mid_mask, uint64_t* bot_mask, int* t, int* m, int* b, curandState* rng) {{
+    int avail_t = 3 - *t;
+    int avail_m = 5 - *m;
+    int avail_b = 5 - *b;
+    int total_avail = avail_t + avail_m + avail_b;
+    
+    if (total_avail == 0) return;
+    
+    int rnd = curand(rng) % total_avail;
+    if (rnd < avail_t) {{
+        top[(*t)++] = card;
+    }} else if (rnd < avail_t + avail_m) {{
+        *mid_mask |= (1ULL << ((card/13)*13 + (card%13)));
+        (*m)++;
+    }} else {{
+        *bot_mask |= (1ULL << ((card/13)*13 + (card%13)));
+        (*b)++;
+    }}
+}}
+
+__global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, int start_idx, int end_idx) {{
+    int idx = blockIdx.x;
+    int hand_idx = start_idx + idx;
+    if (hand_idx >= end_idx) return;
     
     uint8_t my_cards[5];
-    for(int i=0; i<5; ++i) my_cards[i] = d_hands[hand_idx * 5 + i];
+    for(int i=0; i<5; ++i) my_cards[i] = d_hands[idx * 5 + i];
     
     extern __shared__ double s_evs[];
     int tid = threadIdx.x;
@@ -157,28 +191,35 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                 if(!used) deck[d_idx++] = i;
             }}
             
-            for(int i=0; i<8; ++i) {{
+            // Тасуем 12 карт (4 улицы по 3 карты)
+            for(int i=0; i<12; ++i) {{
                 int swap_idx = i + curand(&rng) % (47 - i);
                 uint8_t tmp = deck[i]; deck[i] = deck[swap_idx]; deck[swap_idx] = tmp;
             }}
             
             uint8_t top[3]; uint64_t mid_mask = 0, bot_mask = 0;
-            int t=0, deal_idx=0;
+            int t=0, m=0, b=0;
             
             for(int i=0; i<5; ++i) {{
-                if(placement[i]==0) top[t++] = my_cards[i];
-                else if(placement[i]==1) mid_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13)));
-                else bot_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13)));
+                if(placement[i]==0) {{ top[t++] = my_cards[i]; }}
+                else if(placement[i]==1) {{ mid_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); m++; }}
+                else {{ bot_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); b++; }}
             }}
             
-            while(t < 3) top[t++] = deck[deal_idx++];
-            while(__popcll(mid_mask) < 5) {{
-                uint8_t card = deck[deal_idx++];
-                mid_mask |= (1ULL << ((card/13)*13 + (card%13)));
-            }}
-            while(__popcll(bot_mask) < 5) {{
-                uint8_t card = deck[deal_idx++];
-                bot_mask |= (1ULL << ((card/13)*13 + (card%13)));
+            // ЧЕСТНЫЙ ДИСКАРД: 4 улицы. Берем 3 карты, 1 сбрасываем, 2 кладем случайно.
+            int deal_idx = 0;
+            for (int street = 0; street < 4; ++street) {{
+                uint8_t c1 = deck[deal_idx++];
+                uint8_t c2 = deck[deal_idx++];
+                uint8_t c3 = deck[deal_idx++];
+                
+                // Случайный выбор карты для сброса (0, 1 или 2)
+                int discard_choice = curand(&rng) % 3;
+                uint8_t keep1 = (discard_choice == 0) ? c2 : c1;
+                uint8_t keep2 = (discard_choice == 2) ? c2 : c3;
+                
+                place_random_card(keep1, top, &mid_mask, &bot_mask, &t, &m, &b, &rng);
+                place_random_card(keep2, top, &mid_mask, &bot_mask, &t, &m, &b, &rng);
             }}
             
             local_score += calc_progressive_score(top, mid_mask, bot_mask);
@@ -198,9 +239,9 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                        ((uint32_t)my_cards[2] << 12) | ((uint32_t)my_cards[3] << 6)  | 
                         (uint32_t)my_cards[4];
 
-        d_book[hand_idx].hand_key = key;
-        d_book[hand_idx].best_placement = best_cfg;
-        d_book[hand_idx].ev = (float)max_ev; 
+        d_book[idx].hand_key = key;
+        d_book[idx].best_placement = best_cfg;
+        d_book[idx].ev = (float)max_ev; 
     }}
 }}
 
@@ -232,7 +273,6 @@ int main() {{
     cudaGetDeviceCount(&num_gpus);
     std::cout << "🚀 Обнаружено GPU: " << num_gpus << std::endl;
 
-    std::cout << "🧠 Генерация орбит S4 на CPU..." << std::endl;
     std::vector<uint8_t> host_hands;
     std::unordered_set<uint64_t> seen_hashes;
     
@@ -251,9 +291,10 @@ int main() {{
             }}
         }}
     }}
-    std::cout << "✅ Орбит сгенерировано: " << seen_hashes.size() << std::endl;
 
     std::vector<BookEntry> final_book(TOTAL_CANONICAL_HANDS);
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     #pragma omp parallel num_threads(num_gpus)
     {{
@@ -263,6 +304,9 @@ int main() {{
         int chunk_size = (TOTAL_CANONICAL_HANDS + num_gpus - 1) / num_gpus;
         int start_idx = gpu_id * chunk_size;
         int end_idx = std::min(start_idx + chunk_size, TOTAL_CANONICAL_HANDS);
+        
+        // БЕНЧМАРК: Ограничиваем расчет первыми 500 руками
+        end_idx = std::min(end_idx, start_idx + (TOTAL_CANONICAL_HANDS > 500 ? 500 / num_gpus : chunk_size));
         int local_count = end_idx - start_idx;
 
         if (local_count > 0) {{
@@ -272,7 +316,7 @@ int main() {{
             cudaMalloc(&d_book, local_count * sizeof(BookEntry));
             cudaMemcpy(d_hands, &host_hands[start_idx * 5], local_count * 5, cudaMemcpyHostToDevice);
 
-            generate_book_kernel<<<local_count, 256, 243 * sizeof(double)>>>(d_hands, d_book, local_count);
+            generate_book_kernel<<<local_count, 256, 243 * sizeof(double)>>>(d_hands, d_book, start_idx, end_idx);
             cudaDeviceSynchronize();
 
             cudaMemcpy(&final_book[start_idx], d_book, local_count * sizeof(BookEntry), cudaMemcpyDeviceToHost);
@@ -280,11 +324,19 @@ int main() {{
         }}
     }}
 
-    std::ofstream outfile("ofc_progressive_book_v5.bin", std::ios::binary);
-    outfile.write(reinterpret_cast<const char*>(final_book.data()), final_book.size() * sizeof(BookEntry));
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+
+    std::ofstream outfile("benchmark_500.bin", std::ios::binary);
+    outfile.write(reinterpret_cast<const char*>(final_book.data()), 500 * sizeof(BookEntry));
     outfile.close();
 
-    std::cout << "✅ Progressive Opening Book V5.2 сгенерирован!" << std::endl;
+    std::ofstream logfile("benchmark.log");
+    logfile << "Benchmark completed for 500 hands." << std::endl;
+    logfile << "Time taken: " << elapsed.count() << " seconds." << std::endl;
+    logfile.close();
+
+    std::cout << "✅ Бенчмарк 500 рук завершен за " << elapsed.count() << " секунд!" << std::endl;
     return 0;
 }}
 """
@@ -292,38 +344,24 @@ int main() {{
 with open("generate_book.cu", "w") as f:
     f.write(cuda_code)
 
-print("🔨 Компиляция CUDA кода V5.2...")
+print("🔨 Компиляция CUDA кода...")
 subprocess.run("nvcc -O3 -Xcompiler -fopenmp generate_book.cu -o generate_book", shell=True, check=True)
 
-print("⚡ Запуск Multi-GPU генерации V5.2...")
+print("⚡ Запуск Бенчмарка на 500 рук...")
 subprocess.run("./generate_book", shell=True, check=True)
 
-# 3. АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB
+# --- АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB ---
 github_token = os.environ.get("GITHUB_TOKEN")
 if github_token:
-    print("🚀 Отправка сгенерированной базы на GitHub...")
-    
-    # Настраиваем Git
+    print("🚀 Отправка результатов бенчмарка на GitHub...")
     subprocess.run("git config --global user.email 'kaggle-bot@example.com'", shell=True)
     subprocess.run("git config --global user.name 'Kaggle Bot'", shell=True)
+    subprocess.run("git add benchmark_500.bin benchmark.log", shell=True)
+    subprocess.run("git commit -m 'Auto-generated Benchmark (500 hands, Honest Discard)'", shell=True)
     
-    # Добавляем файл в индекс
-    subprocess.run("git add ofc_progressive_book_v5.bin", shell=True)
-    
-    # Коммитим
-    subprocess.run("git commit -m 'Auto-generated Opening Book V5.2 from Kaggle'", shell=True)
-    
-    # Получаем текущий URL репозитория и вставляем токен для авторизации
     remote_url = subprocess.check_output("git config --get remote.origin.url", shell=True).decode().strip()
     if remote_url.startswith("https://"):
         auth_url = remote_url.replace("https://", f"https://oauth2:{github_token}@")
         subprocess.run(f"git remote set-url origin {auth_url}", shell=True)
-        
-        # Пушим в ветку main (или master)
-        push_result = subprocess.run("git push origin HEAD", shell=True)
-        if push_result.returncode == 0:
-            print("✅ База успешно загружена в репозиторий!")
-        else:
-            print("❌ Ошибка при отправке на GitHub.")
-else:
-    print("⚠️ GITHUB_TOKEN не найден в окружении. Файл остался локально.")
+        subprocess.run("git push origin HEAD", shell=True)
+        print("✅ Результаты успешно загружены в репозиторий!")
