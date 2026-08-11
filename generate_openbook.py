@@ -25,7 +25,7 @@ def generate_3card_lut():
 
 lut_3card_str = generate_3card_lut()
 
-# 2. C++/CUDA КОД V9.0 (WARP REDUCTION + GREEDY)
+# 2. C++/CUDA КОД V9.1 (ИСПРАВЛЕНА КОМПИЛЯЦИЯ)
 cuda_code = f"""
 #include <iostream>
 #include <vector>
@@ -34,10 +34,11 @@ cuda_code = f"""
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 #include <omp.h>
 
 constexpr int TOTAL_CANONICAL_HANDS = 134459;
-constexpr int SIMS_PER_HAND = 2048; // Кратно 256 для идеального Warp Reduction
+constexpr int SIMS_PER_HAND = 2048; 
 constexpr int CHECKPOINT_EVERY = 5000; 
 
 #pragma pack(push, 1)
@@ -195,25 +196,23 @@ __device__ void play_street_greedy(uint8_t c1, uint8_t c2, uint8_t c3, uint8_t* 
     else {{ *bot_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*b)++; }}
 }}
 
-// --- WARP REDUCTION KERNEL ---
 __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, int start_idx, int end_idx) {{
-    int hand_idx = start_idx + blockIdx.x;
+    // ИСПРАВЛЕНО: Объявляем idx и hand_idx в самом начале!
+    int idx = blockIdx.x;
+    int hand_idx = start_idx + idx;
     if (hand_idx >= end_idx) return;
     
     uint8_t my_cards[5];
-    for(int i=0; i<5; ++i) my_cards[i] = d_hands[blockIdx.x * 5 + i];
+    for(int i=0; i<5; ++i) my_cards[i] = d_hands[idx * 5 + i];
     
     extern __shared__ double s_evs[];
     int tid = threadIdx.x;
     
-    // Инициализация Shared Memory
     for(int i=tid; i<243; i+=blockDim.x) s_evs[i] = 0.0;
     __syncthreads();
 
     uint32_t rng_state = 1337 + hand_idx * 256 + tid;
-
-    // Каждая нить берет ВСЕ 243 расстановки, но делает только часть симуляций
-    int sims_per_thread = SIMS_PER_HAND / blockDim.x; // 2048 / 256 = 8 симуляций на нить
+    int sims_per_thread = SIMS_PER_HAND / blockDim.x; 
 
     for (int c = 0; c < 243; ++c) {{
         int row_counts[3] = {{0, 0, 0}};
@@ -260,12 +259,10 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
             local_score += calc_progressive_score(top, mid_mask, bot_mask);
         }}
         
-        // Атомарное сложение результатов всех 256 нитей для данной расстановки
         atomicAdd(&s_evs[c], local_score);
     }}
     __syncthreads();
     
-    // Нить 0 находит максимум и записывает в глобальную память
     if (tid == 0) {{
         double max_ev = -1e8;
         uint8_t best_cfg = 0;
@@ -278,6 +275,7 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                        ((uint32_t)my_cards[2] << 12) | ((uint32_t)my_cards[3] << 6)  | 
                         (uint32_t)my_cards[4];
 
+        // ИСПРАВЛЕНО: idx теперь существует и работает корректно!
         d_book[idx].hand_key = key;
         d_book[idx].best_placement = best_cfg;
         d_book[idx].ev = (float)max_ev; 
@@ -375,7 +373,6 @@ int main() {{
                 cudaMalloc(&d_book, local_count * sizeof(BookEntry));
                 cudaMemcpy(d_hands, &host_hands[local_start * 5], local_count * 5, cudaMemcpyHostToDevice);
 
-                // 256 нитей на блок для Warp Reduction
                 generate_book_kernel<<<local_count, 256, 243 * sizeof(double)>>>(d_hands, d_book, local_start, local_end);
                 cudaDeviceSynchronize();
 
@@ -387,15 +384,15 @@ int main() {{
         save_checkpoint(final_book, chunk_end);
         std::cout << "💾 Прогресс: " << chunk_end << " / " << TOTAL_CANONICAL_HANDS << " (" << (100.0 * chunk_end / TOTAL_CANONICAL_HANDS) << "%)" << std::endl;
         
-        // LIVE PUSH НА GITHUB КАЖДЫЕ 5000 РУК
-        system("git add checkpoint_v9.bin && git commit -m 'Auto-save checkpoint' && git push origin HEAD");
+        // ИСПРАВЛЕНО: Приведение к (void) для подавления Warning
+        (void)system("git add checkpoint_v9.bin && git commit -m 'Auto-save checkpoint' && git push origin HEAD");
     }}
 
     std::ofstream outfile("ofc_progressive_book_v9.bin", std::ios::binary);
     outfile.write(reinterpret_cast<const char*>(final_book.data()), final_book.size() * sizeof(BookEntry));
     outfile.close();
 
-    std::cout << "✅ База V9.0 успешно сгенерирована!" << std::endl;
+    std::cout << "✅ База V9.1 успешно сгенерирована!" << std::endl;
     return 0;
 }}
 """
@@ -403,17 +400,24 @@ int main() {{
 with open("generate_book.cu", "w") as f:
     f.write(cuda_code)
 
-print("🔨 Компиляция CUDA кода V9.0...")
+print("🔨 Компиляция CUDA кода V9.1...")
 subprocess.run("nvcc -O3 -Xcompiler -fopenmp generate_book.cu -o generate_book", shell=True, check=True)
 
-print("⚡ Запуск Multi-GPU генерации V9.0...")
+print("⚡ Запуск Multi-GPU генерации V9.1...")
 subprocess.run("./generate_book", shell=True, check=True)
 
-# --- ФИНАЛЬНЫЙ ПУШ НА GITHUB ---
+# --- АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB ---
 github_token = os.environ.get("GITHUB_TOKEN")
 if github_token:
-    print("🚀 Отправка финальных результатов на GitHub...")
+    print("🚀 Отправка результатов на GitHub...")
+    subprocess.run("git config --global user.email 'kaggle-bot@example.com'", shell=True)
+    subprocess.run("git config --global user.name 'Kaggle Bot'", shell=True)
     subprocess.run("git add ofc_progressive_book_v9.bin checkpoint_v9.bin", shell=True)
-    subprocess.run("git commit -m 'Auto-generated Perfect Book V9.0 (Warp Reduction)'", shell=True)
-    subprocess.run("git push origin HEAD", shell=True)
-    print("✅ База V9.0 успешно загружена в репозиторий!")
+    subprocess.run("git commit -m 'Auto-generated Perfect Book V9.1 (Warp Reduction)'", shell=True)
+    
+    remote_url = subprocess.check_output("git config --get remote.origin.url", shell=True).decode().strip()
+    if remote_url.startswith("https://"):
+        auth_url = remote_url.replace("https://", f"https://oauth2:{github_token}@")
+        subprocess.run(f"git remote set-url origin {auth_url}", shell=True)
+        subprocess.run("git push origin HEAD", shell=True)
+        print("✅ База V9.1 успешно загружена в репозиторий!")
