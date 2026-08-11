@@ -1,8 +1,7 @@
 import os
-import base64
 import struct
-from IPython.display import HTML, display
 import subprocess
+import time
 
 # 1. 3-карточный LUT (uint32_t)
 def generate_3card_lut():
@@ -27,7 +26,7 @@ def generate_3card_lut():
 
 lut_3card_str = generate_3card_lut()
 
-# 2. C++/CUDA КОД V11.0 (EXPECTIMAX + CRN + STRICT FOULS)
+# 2. C++/CUDA КОД V12.1 (FIXED SYNTAX & TRUE CRN)
 cuda_code = f"""
 #include <iostream>
 #include <vector>
@@ -35,13 +34,24 @@ cuda_code = f"""
 #include <fstream>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cuda_runtime.h>
-#include <curand_kernel.h>
 #include <omp.h>
 
 constexpr int TOTAL_CANONICAL_HANDS = 134459;
-constexpr int SIMS_PER_HAND = 4096; // CRN симуляций на руку
+constexpr int SIMS_PER_HAND = 4096; // 4096 честных CRN симуляций на каждую расстановку
 constexpr int CHECKPOINT_EVERY = 5000;
+
+#define CUDA_CHECK(call) do {{ \\
+    cudaError_t err__ = (call); \\
+    if (err__ != cudaSuccess) {{ \\
+        fprintf(stderr, "❌ CUDA error %s:%d: %s\\n", \\
+                __FILE__, __LINE__, cudaGetErrorString(err__)); \\
+        std::exit(1); \\
+    }} \\
+}} while (0)
 
 #pragma pack(push, 1)
 struct BookEntry {{
@@ -51,10 +61,12 @@ struct BookEntry {{
 }};
 #pragma pack(pop)
 
+// Инициализация constant memory на этапе компиляции
 __constant__ uint32_t d_lut_3card[2197] = {{ {lut_3card_str} }};
 __constant__ float FL_BONUS_QQ_KK_AA[3] = {{ 28.5f, 38.3f, 47.4f }};
 __constant__ float FL_BONUS_TRIPS = 67.7f;
 
+// Универсальный атомарный add для double
 __device__ inline double atomicAddDouble(double* address, double val) {{
 #if __CUDA_ARCH__ >= 600
     return atomicAdd(address, val);
@@ -70,6 +82,15 @@ __device__ inline double atomicAddDouble(double* address, double val) {{
 #endif
 }}
 
+// Безопасный SplitMix32 PRNG (исключает застревание в 0)
+__device__ inline uint32_t mix32(uint32_t x) {{
+    x += 0x9E3779B9u;
+    x = (x ^ (x >> 16)) * 0x85EBCA6Bu;
+    x = (x ^ (x >> 13)) * 0xC2B2AE35u;
+    x = x ^ (x >> 16);
+    return x ? x : 0xA341316Cu;
+}}
+
 __device__ inline uint32_t fast_rand(uint32_t* state) {{
     uint32_t x = *state;
     x ^= x << 13;
@@ -79,6 +100,7 @@ __device__ inline uint32_t fast_rand(uint32_t* state) {{
     return x;
 }}
 
+// Безопасный 5-карточный битборд оценщик
 __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
     uint64_t spades   = mask & 0x1FFF;
     uint64_t hearts   = (mask >> 13) & 0x1FFF;
@@ -90,8 +112,11 @@ __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
     
     bool straight = false;
     int str_high = -1;
-    int ls = __clz(ranks & (ranks<<1) & (ranks<<2) & (ranks<<3) & (ranks<<4));
-    if (ls < 32) {{ straight = true; str_high = 31 - ls; }}
+    uint32_t straight_bits = ranks & (ranks << 1) & (ranks << 2) & (ranks << 3) & (ranks << 4);
+    if (straight_bits != 0) {{
+        straight = true;
+        str_high = 31 - __clz(straight_bits);
+    }}
     if (ranks == 0x100f) {{ straight = true; str_high = 3; }} 
     
     int quad=-1, trip=-1, pair1=-1, pair2=-1;
@@ -120,7 +145,6 @@ __device__ uint32_t eval_5card_bitboard(uint64_t mask) {{
     return (1<<24) | (r1<<20) | (r2<<16) | ranks;
 }}
 
-// СТРОГАЯ МАТЕМАТИЧЕСКАЯ ПРОВЕРКА ФОЛОВ МЕЖДУ СТРОКАМИ
 __device__ inline bool is_foul_strict(uint32_t r_top, uint32_t r_mid, uint32_t r_bot) {{
     if (r_mid > r_bot) return true;
 
@@ -146,7 +170,7 @@ __device__ inline bool is_foul_strict(uint32_t r_top, uint32_t r_mid, uint32_t r
     return false;
 }}
 
-__device__ double calc_progressive_score_v11(const uint8_t* top, uint64_t mid_mask, uint64_t bot_mask) {{
+__device__ double calc_progressive_score_v12(const uint8_t* top, uint64_t mid_mask, uint64_t bot_mask) {{
     uint32_t r_top = d_lut_3card[(top[0]%13)*169 + (top[1]%13)*13 + (top[2]%13)];
     uint32_t r_mid = eval_5card_bitboard(mid_mask);
     uint32_t r_bot = eval_5card_bitboard(bot_mask);
@@ -186,7 +210,7 @@ __device__ double calc_progressive_score_v11(const uint8_t* top, uint64_t mid_ma
     return score;
 }}
 
-__device__ float eval_partial_state_v11(const uint8_t* top, int t, uint64_t mid_mask, int m, uint64_t bot_mask, int b) {{
+__device__ float eval_partial_state_v12(const uint8_t* top, int t, uint64_t mid_mask, int m, uint64_t bot_mask, int b) {{
     uint32_t r_top = (t == 3) ? d_lut_3card[(top[0]%13)*169 + (top[1]%13)*13 + (top[2]%13)] : 0;
     uint32_t r_mid = (m == 5) ? eval_5card_bitboard(mid_mask) : 0;
     uint32_t r_bot = (b == 5) ? eval_5card_bitboard(bot_mask) : 0;
@@ -210,7 +234,6 @@ __device__ float eval_partial_state_v11(const uint8_t* top, int t, uint64_t mid_
     return p_score;
 }}
 
-// 1-PLY EXPECTIMAX УМНЫЙ ПЛАСЕР УЛИЦ 2-5
 __device__ void play_street_expectimax(uint8_t c1, uint8_t c2, uint8_t c3,
                                        uint8_t* top, int* t,
                                        uint64_t* mid_mask, int* m,
@@ -242,7 +265,7 @@ __device__ void play_street_expectimax(uint8_t c1, uint8_t c2, uint8_t c3,
                 else if (r2 == 1) {{ tmp_m_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_m++; }}
                 else {{ tmp_b_mask |= (1ULL << ((k2/13)*13 + (k2%13))); tmp_b++; }}
 
-                float val = eval_partial_state_v11(tmp_top, tmp_t, tmp_m_mask, tmp_m, tmp_b_mask, tmp_b);
+                float val = eval_partial_state_v12(tmp_top, tmp_t, tmp_m_mask, tmp_m, tmp_b_mask, tmp_b);
                 if (val > best_val) {{
                     best_val = val;
                     best_p = p;
@@ -265,7 +288,7 @@ __device__ void play_street_expectimax(uint8_t c1, uint8_t c2, uint8_t c3,
     else {{ *bot_mask |= (1ULL << ((k2/13)*13 + (k2%13))); (*b)++; }}
 }}
 
-// СУПЕР-ЯДРО С CRN И 1-PLY EXPECTIMAX
+// ИСПРАВЛЕННОЕ КУДА-ЯДРО V12.1 (НАСТОЯЩИЙ CRN + EXACT 4096 SAMPLES)
 __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, int start_idx, int end_idx) {{
     int idx = blockIdx.x;
     int hand_idx = start_idx + idx;
@@ -280,20 +303,16 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
     for(int i=tid; i<243; i+=blockDim.x) s_evs[i] = 0.0;
     __syncthreads();
 
-    int sims_per_thread = SIMS_PER_HAND / blockDim.x;
-
-    // CRN: Все расстановки оцениваются на ОДНИХ И ТЕХ ЖЕ случайных колодах!
-    for (int sim = 0; sim < sims_per_thread; ++sim) {{
-        uint32_t rng_state = 1337 + hand_idx * 10000 + (tid * sims_per_thread + sim);
-        curandState rng;
-        curand_init(rng_state, 0, 0, &rng);
+    // ИСПРАВЛЕНО: Каждая нить берет свой sim_id, но проверяет ВСЕ 243 расстановки!
+    for (int sim_id = tid; sim_id < SIMS_PER_HAND; sim_id += blockDim.x) {{
+        uint32_t rng_state = mix32((uint32_t)hand_idx ^ mix32((uint32_t)sim_id));
 
         uint8_t deck[47];
         int d_idx = 0;
         for(int i=0; i<52; ++i) {{
             bool used = false;
             for(int j=0; j<5; ++j) if(my_cards[j] == i) used = true;
-            if(!used) deck[d_idx++] = i;
+            if(!used) deck[d_idx++] = (uint8_t)i;
         }}
 
         for(int i=0; i<12; ++i) {{
@@ -302,21 +321,25 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
             uint8_t tmp = deck[i]; deck[i] = deck[swap_idx]; deck[swap_idx] = tmp;
         }}
 
-        for (int c = tid; c < 243; c += blockDim.x) {{
+        for (int c = 0; c < 243; ++c) {{
             int row_counts[3] = {{0, 0, 0}};
             uint8_t placement[5];
             int temp_c = c;
-            for(int i=0; i<5; ++i) {{ placement[i] = temp_c % 3; row_counts[temp_c % 3]++; temp_c /= 3; }}
+            for(int i=0; i<5; ++i) {{
+                placement[i] = temp_c % 3;
+                row_counts[placement[i]]++;
+                temp_c /= 3;
+            }}
 
             if (row_counts[0] > 3 || row_counts[1] > 5 || row_counts[2] > 5) continue;
 
             uint8_t top[3]; uint64_t mid_mask = 0, bot_mask = 0;
-            int t=0, m=0, b=0;
+            int t = 0, m = 0, b = 0;
 
             for(int i=0; i<5; ++i) {{
                 if(placement[i]==0) {{ top[t++] = my_cards[i]; }}
-                else if(placement[i]==1) {{ mid_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); m++; }}
-                else {{ bot_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); b++; }}
+                else if(placement[i]==1) {{ mid_mask |= (1ULL << my_cards[i]); m++; }}
+                else {{ bot_mask |= (1ULL << my_cards[i]); b++; }}
             }}
 
             int deal_idx = 0;
@@ -327,18 +350,22 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                 play_street_expectimax(c1, c2, c3, top, &t, &mid_mask, &m, &bot_mask, &b);
             }}
 
-            double score = calc_progressive_score_v11(top, mid_mask, bot_mask);
+            double score = calc_progressive_score_v12(top, mid_mask, bot_mask);
             atomicAddDouble(&s_evs[c], score);
         }}
     }}
     __syncthreads();
 
+    // ИСПРАВЛЕНО: Накоплено ровно 4096 сэмплов, деление даст точное EV!
     if (tid == 0) {{
         double max_ev = -1e8;
         uint8_t best_cfg = 0;
         for(int i=0; i<243; ++i) {{
             double final_ev = s_evs[i] / (double)SIMS_PER_HAND;
-            if(final_ev > max_ev && s_evs[i] != 0.0) {{ max_ev = final_ev; best_cfg = i; }}
+            if(final_ev > max_ev) {{ // ИСПРАВЛЕНО: убрали s_evs[i] != 0.0
+                max_ev = final_ev;
+                best_cfg = (uint8_t)i;
+            }}
         }}
 
         uint32_t key = ((uint32_t)my_cards[0] << 24) | ((uint32_t)my_cards[1] << 18) | 
@@ -375,19 +402,19 @@ uint64_t get_canonical_hash(const uint8_t* hand) {{
 }}
 
 int load_checkpoint(std::vector<BookEntry>& book) {{
-    std::ifstream f("checkpoint_v11.bin", std::ios::binary);
+    std::ifstream f("checkpoint_v12.bin", std::ios::binary);
     if (!f) return 0;
     uint32_t num_done = 0;
     f.read(reinterpret_cast<char*>(&num_done), sizeof(num_done));
     if (!f) return 0;
     if (num_done > book.size()) num_done = (uint32_t)book.size();
     f.read(reinterpret_cast<char*>(book.data()), num_done * sizeof(BookEntry));
-    std::cout << "🔄 Восстановление из чекпоинта V11. Готово рук: " << num_done << std::endl;
+    std::cout << "🔄 Восстановление из чекпоинта V12.1. Готово рук: " << num_done << std::endl;
     return (int)num_done;
 }}
 
 void save_checkpoint(const std::vector<BookEntry>& book, int num_done) {{
-    std::ofstream f("checkpoint_v11.bin", std::ios::binary | std::ios::trunc);
+    std::ofstream f("checkpoint_v12.bin", std::ios::binary | std::ios::trunc);
     uint32_t n = (uint32_t)num_done;
     f.write(reinterpret_cast<const char*>(&n), sizeof(n));
     f.write(reinterpret_cast<const char*>(book.data()), num_done * sizeof(BookEntry));
@@ -395,10 +422,15 @@ void save_checkpoint(const std::vector<BookEntry>& book, int num_done) {{
 }}
 
 int main() {{
-    int num_gpus;
-    cudaGetDeviceCount(&num_gpus);
+    int num_gpus = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
+    if (num_gpus <= 0) {{
+        std::cerr << "❌ CUDA видеокарты не найдены!" << std::endl;
+        return 1;
+    }}
     std::cout << "🚀 Обнаружено GPU: " << num_gpus << std::endl;
 
+    std::cout << "🧠 Генерация орбит S4 на CPU..." << std::endl;
     std::vector<uint8_t> host_hands;
     std::unordered_set<uint64_t> seen_hashes;
     
@@ -418,6 +450,12 @@ int main() {{
         }}
     }}
 
+    if (seen_hashes.size() != TOTAL_CANONICAL_HANDS || host_hands.size() != TOTAL_CANONICAL_HANDS * 5) {{
+        std::cerr << "❌ Ошибка орбит! Ожидалось " << TOTAL_CANONICAL_HANDS << " рук." << std::endl;
+        return 1;
+    }}
+    std::cout << "✅ Число орбит строго совпадает: " << seen_hashes.size() << std::endl;
+
     std::vector<BookEntry> final_book(TOTAL_CANONICAL_HANDS);
     int start_from = load_checkpoint(final_book);
     
@@ -430,7 +468,7 @@ int main() {{
         #pragma omp parallel num_threads(num_gpus)
         {{
             int gpu_id = omp_get_thread_num();
-            cudaSetDevice(gpu_id);
+            CUDA_CHECK(cudaSetDevice(gpu_id));
 
             int per_gpu = (chunk_size + num_gpus - 1) / num_gpus;
             int local_start = chunk_start + gpu_id * per_gpu;
@@ -438,34 +476,41 @@ int main() {{
             int local_count = local_end - local_start;
 
             if (local_count > 0) {{
-                uint8_t* d_hands;
-                BookEntry* d_book;
-                cudaMalloc(&d_hands, local_count * 5);
-                cudaMalloc(&d_book, local_count * sizeof(BookEntry));
-                cudaMemcpy(d_hands, &host_hands[local_start * 5], local_count * 5, cudaMemcpyHostToDevice);
+                uint8_t* d_hands = nullptr;
+                BookEntry* d_book = nullptr;
+
+                CUDA_CHECK(cudaMalloc(&d_hands, local_count * 5));
+                CUDA_CHECK(cudaMalloc(&d_book, local_count * sizeof(BookEntry)));
+                CUDA_CHECK(cudaMemcpy(d_hands, &host_hands[local_start * 5], local_count * 5, cudaMemcpyHostToDevice));
 
                 generate_book_kernel<<<local_count, 256, 243 * sizeof(double)>>>(d_hands, d_book, local_start, local_end);
-                cudaDeviceSynchronize();
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
 
-                cudaMemcpy(&final_book[local_start], d_book, local_count * sizeof(BookEntry), cudaMemcpyDeviceToHost);
-                cudaFree(d_hands); cudaFree(d_book);
+                CUDA_CHECK(cudaMemcpy(&final_book[local_start], d_book, local_count * sizeof(BookEntry), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaFree(d_hands));
+                CUDA_CHECK(cudaFree(d_book));
             }}
         }}
         
         save_checkpoint(final_book, chunk_end);
-        std::cout << "💾 Прогресс V11: " << chunk_end << " / " << TOTAL_CANONICAL_HANDS << " (" << (100.0 * chunk_end / TOTAL_CANONICAL_HANDS) << "%)" << std::endl;
+        std::cout << "💾 Прогресс V12.1: " << chunk_end << " / " << TOTAL_CANONICAL_HANDS << " (" << (100.0 * chunk_end / TOTAL_CANONICAL_HANDS) << "%)" << std::endl;
         
-        if (system("git add checkpoint_v11.bin && git commit -m 'Auto-save checkpoint V11' && git push origin HEAD")) {{}}
+        if (system("git add checkpoint_v12.bin && git commit -m 'Auto-save checkpoint V12.1' && git push origin HEAD")) {{}}
     }}
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
 
-    std::ofstream outfile("ofc_progressive_book_v11.bin", std::ios::binary);
+    std::ofstream outfile("ofc_progressive_book_v12.bin", std::ios::binary);
+    if (!outfile) {{
+        std::cerr << "❌ Ошибка открытия выходного файла!" << std::endl;
+        return 1;
+    }}
     outfile.write(reinterpret_cast<const char*>(final_book.data()), final_book.size() * sizeof(BookEntry));
     outfile.close();
 
-    std::cout << "✅ Полная база V11.0 (Expectimax + CRN) сгенерирована за " << elapsed.count() << " секунд!" << std::endl;
+    std::cout << "✅ Идеальная база V12.1 (TRUE CRN + 100% COMPILED) сгенерирована за " << elapsed.count() << " секунд!" << std::endl;
     return 0;
 }}
 """
@@ -473,24 +518,24 @@ int main() {{
 with open("generate_book.cu", "w") as f:
     f.write(cuda_code)
 
-print("🔨 Компиляция CUDA кода V11.0...")
+print("🔨 Компиляция CUDA кода V12.1 с флагом -arch=sm_75...")
 subprocess.run("nvcc -O3 -arch=sm_75 -Xcompiler -fopenmp generate_book.cu -o generate_book", shell=True, check=True)
 
-print("⚡ Запуск Multi-GPU генерации V11.0...")
+print("⚡ Запуск Multi-GPU генерации V12.1...")
 subprocess.run("./generate_book", shell=True, check=True)
 
 # --- АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB ---
 github_token = os.environ.get("GITHUB_TOKEN")
 if github_token:
-    print("🚀 Отправка результатов на GitHub...")
+    print("🚀 Отправка результатов V12.1 на GitHub...")
     subprocess.run("git config --global user.email 'kaggle-bot@example.com'", shell=True)
     subprocess.run("git config --global user.name 'Kaggle Bot'", shell=True)
-    subprocess.run("git add ofc_progressive_book_v11.bin checkpoint_v11.bin", shell=True)
-    subprocess.run("git commit -m 'Auto-generated Perfect Book V11.0 (Expectimax + CRN)'", shell=True)
+    subprocess.run("git add ofc_progressive_book_v12.bin checkpoint_v12.bin", shell=True)
+    subprocess.run("git commit -m 'Auto-generated Perfect Book V12.1 (Fixed Syntax & True CRN)'", shell=True)
     
     remote_url = subprocess.check_output("git config --get remote.origin.url", shell=True).decode().strip()
     if remote_url.startswith("https://"):
         auth_url = remote_url.replace("https://", f"https://oauth2:{github_token}@")
         subprocess.run(f"git remote set-url origin {auth_url}", shell=True)
         subprocess.run("git push origin HEAD", shell=True)
-        print("✅ База V11.0 успешно загружена в репозиторий!")
+        print("✅ База V12.1 успешно загружена в репозиторий!")
