@@ -25,7 +25,7 @@ def generate_3card_lut():
 
 lut_3card_str = generate_3card_lut()
 
-# 2. C++/CUDA КОД (БЕНЧМАРК 500 РУК, ЧЕСТНЫЙ ДИСКАРД, ПОЛНАЯ СВОБОДА)
+# 2. C++/CUDA КОД (ПОЛНАЯ ГЕНЕРАЦИЯ 134,459 РУК)
 cuda_code = f"""
 #include <iostream>
 #include <vector>
@@ -37,8 +37,7 @@ cuda_code = f"""
 #include <curand_kernel.h>
 #include <omp.h>
 
-// БЕНЧМАРК: Считаем только первые 500 рук
-constexpr int TOTAL_CANONICAL_HANDS = 500;
+constexpr int TOTAL_CANONICAL_HANDS = 134459;
 constexpr int SIMS_PER_HAND = 2000; 
 
 #pragma pack(push, 1)
@@ -134,7 +133,6 @@ __device__ double calc_progressive_score(const uint8_t* top, uint64_t mid_mask, 
     return score;
 }}
 
-// Вспомогательная функция: случайное размещение карты в свободный слот
 __device__ void place_random_card(uint8_t card, uint8_t* top, uint64_t* mid_mask, uint64_t* bot_mask, int* t, int* m, int* b, curandState* rng) {{
     int avail_t = 3 - *t;
     int avail_m = 5 - *m;
@@ -191,7 +189,6 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                 if(!used) deck[d_idx++] = i;
             }}
             
-            // Тасуем 12 карт (4 улицы по 3 карты)
             for(int i=0; i<12; ++i) {{
                 int swap_idx = i + curand(&rng) % (47 - i);
                 uint8_t tmp = deck[i]; deck[i] = deck[swap_idx]; deck[swap_idx] = tmp;
@@ -206,14 +203,12 @@ __global__ void generate_book_kernel(const uint8_t* d_hands, BookEntry* d_book, 
                 else {{ bot_mask |= (1ULL << ((my_cards[i]/13)*13 + (my_cards[i]%13))); b++; }}
             }}
             
-            // ЧЕСТНЫЙ ДИСКАРД: 4 улицы. Берем 3 карты, 1 сбрасываем, 2 кладем случайно.
             int deal_idx = 0;
             for (int street = 0; street < 4; ++street) {{
                 uint8_t c1 = deck[deal_idx++];
                 uint8_t c2 = deck[deal_idx++];
                 uint8_t c3 = deck[deal_idx++];
                 
-                // Случайный выбор карты для сброса (0, 1 или 2)
                 int discard_choice = curand(&rng) % 3;
                 uint8_t keep1 = (discard_choice == 0) ? c2 : c1;
                 uint8_t keep2 = (discard_choice == 2) ? c2 : c3;
@@ -304,9 +299,6 @@ int main() {{
         int chunk_size = (TOTAL_CANONICAL_HANDS + num_gpus - 1) / num_gpus;
         int start_idx = gpu_id * chunk_size;
         int end_idx = std::min(start_idx + chunk_size, TOTAL_CANONICAL_HANDS);
-        
-        // БЕНЧМАРК: Ограничиваем расчет первыми 500 руками
-        end_idx = std::min(end_idx, start_idx + (TOTAL_CANONICAL_HANDS > 500 ? 500 / num_gpus : chunk_size));
         int local_count = end_idx - start_idx;
 
         if (local_count > 0) {{
@@ -327,16 +319,16 @@ int main() {{
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
 
-    std::ofstream outfile("benchmark_500.bin", std::ios::binary);
-    outfile.write(reinterpret_cast<const char*>(final_book.data()), 500 * sizeof(BookEntry));
+    std::ofstream outfile("ofc_progressive_book_v8.bin", std::ios::binary);
+    outfile.write(reinterpret_cast<const char*>(final_book.data()), final_book.size() * sizeof(BookEntry));
     outfile.close();
 
-    std::ofstream logfile("benchmark.log");
-    logfile << "Benchmark completed for 500 hands." << std::endl;
+    std::ofstream logfile("generation.log");
+    logfile << "Full generation completed for 134459 hands." << std::endl;
     logfile << "Time taken: " << elapsed.count() << " seconds." << std::endl;
     logfile.close();
 
-    std::cout << "✅ Бенчмарк 500 рук завершен за " << elapsed.count() << " секунд!" << std::endl;
+    std::cout << "✅ Полная база сгенерирована за " << elapsed.count() << " секунд!" << std::endl;
     return 0;
 }}
 """
@@ -347,21 +339,21 @@ with open("generate_book.cu", "w") as f:
 print("🔨 Компиляция CUDA кода...")
 subprocess.run("nvcc -O3 -Xcompiler -fopenmp generate_book.cu -o generate_book", shell=True, check=True)
 
-print("⚡ Запуск Бенчмарка на 500 рук...")
+print("⚡ Запуск Multi-GPU генерации (134,459 рук)...")
 subprocess.run("./generate_book", shell=True, check=True)
 
 # --- АВТОМАТИЧЕСКИЙ ПУШ НА GITHUB ---
 github_token = os.environ.get("GITHUB_TOKEN")
 if github_token:
-    print("🚀 Отправка результатов бенчмарка на GitHub...")
+    print("🚀 Отправка результатов на GitHub...")
     subprocess.run("git config --global user.email 'kaggle-bot@example.com'", shell=True)
     subprocess.run("git config --global user.name 'Kaggle Bot'", shell=True)
-    subprocess.run("git add benchmark_500.bin benchmark.log", shell=True)
-    subprocess.run("git commit -m 'Auto-generated Benchmark (500 hands, Honest Discard)'", shell=True)
+    subprocess.run("git add ofc_progressive_book_v8.bin generation.log", shell=True)
+    subprocess.run("git commit -m 'Auto-generated Full Book V8.0 (Honest Discard)'", shell=True)
     
     remote_url = subprocess.check_output("git config --get remote.origin.url", shell=True).decode().strip()
     if remote_url.startswith("https://"):
         auth_url = remote_url.replace("https://", f"https://oauth2:{github_token}@")
         subprocess.run(f"git remote set-url origin {auth_url}", shell=True)
         subprocess.run("git push origin HEAD", shell=True)
-        print("✅ Результаты успешно загружены в репозиторий!")
+        print("✅ База успешно загружена в репозиторий!")
