@@ -38,7 +38,7 @@ cuda_code = f"""
 #include <omp.h>
 
 constexpr int TOTAL_CANONICAL_HANDS = 134459;
-constexpr int SIMS_PER_HAND = 2000; 
+constexpr int SIMS_PER_HAND = 100000; 
 
 #pragma pack(push, 1)
 struct BookEntry {{
